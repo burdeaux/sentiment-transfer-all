@@ -6,11 +6,14 @@ def tensor2text(vocab, tensor):
     index2word = vocab.itos
     eos_idx = vocab.stoi['<eos>']
     unk_idx = vocab.stoi['<unk>']
-    stop_idxs = [vocab.stoi['!'], vocab.stoi['.'], vocab.stoi['?']]
+    stop_idxs=[]
+    #wtf????who wrote this???
+    # stop_idxs = [vocab.stoi['!'], vocab.stoi['.'], vocab.stoi['?']]
     for sample in tensor:
         sample_filtered = []
         prev_token = None
         for idx in list(sample):
+            #no stop_ids anymore
             if prev_token in stop_idxs:
                 break
             if idx == unk_idx or idx == prev_token or idx == eos_idx:

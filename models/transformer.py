@@ -27,12 +27,15 @@ class StyleTransformer(nn.Module):
         self.sos_token = nn.Parameter(torch.randn(d_model))
         self.encoder = Encoder(num_layers, d_model, len(vocab), h, dropout)
         self.decoder = Decoder(num_layers, d_model, len(vocab), h, dropout)
-        
+        self.prev_states = None
+
     def forward(self, inp_tokens, gold_tokens, inp_lengths, style,
                 generate=False, differentiable_decode=False, temperature=1.0):
         batch_size = inp_tokens.size(0)
         max_enc_len = inp_tokens.size(1)
-
+        # print(inp_tokens.size())
+        # print(max_enc_len)
+        #check the input length
         assert max_enc_len <= self.max_length
 
         pos_idx = torch.arange(self.max_length).unsqueeze(0).expand((batch_size, -1))
@@ -74,7 +77,8 @@ class StyleTransformer(nn.Module):
                     temperature,
                     prev_states
                 )
-
+                #prev_states为列表，每个128，16，256，
+                # 实际输出为new_state列表，记录每层的输出状态，包含所有位置（不仅为最后一个位置，但是最后一个位置tensor会被拿来embed进行预测.),每经历一次生成，其dim=1维长度+1
                 log_probs.append(log_prob)
                 
                 if differentiable_decode:
@@ -86,9 +90,14 @@ class StyleTransformer(nn.Module):
                 #    break
 
             log_probs = torch.cat(log_probs, 1)
+            self.prev_states=prev_states
             
-            
+        #show prev_states  
+        
         return log_probs
+    def gethook(self):
+        return self.prev_states
+
     
 class Discriminator(nn.Module):
     def __init__(self, config, vocab):
@@ -130,13 +139,66 @@ class Discriminator(nn.Module):
             style_emb = self.style_embed(style).unsqueeze(1)
             enc_input = torch.cat((enc_input, style_emb), 1)
             
-        enc_input = torch.cat((enc_input, self.embed(inp_tokens, pos_idx)), 1)
+        enc_input = torch.cat((enc_input, self.embed(inp_tokens, pos_idx)), 1)#embed(inp_tokens,pos_idx)=[128.16.256].enc_input=[128,17,256]
         
-        encoded_features = self.encoder(enc_input, mask)
-        logits = self.classifier(encoded_features[:, 0])
+        encoded_features = self.encoder(enc_input, mask)#直接拿encoder的输出作为classifer输入[128,17,256]
+        logits = self.classifier(encoded_features[:, 0])#只取第一个位置[128,256],(这个风格来自于bert)关于输入输出维度，仅需考虑最后一维的变换
 
         return F.log_softmax(logits, -1)
         
+
+
+class NatureGAN(nn.Module):
+    def __init__(self, config, vocab):
+        super(NatureGAN, self).__init__()
+        num_styles, num_layers = config.num_styles, config.num_layers
+        self.d_model, self.max_length = config.d_model, config.max_length
+        h, dropout = config.h, config.dropout
+        learned_pos_embed = config.learned_pos_embed
+        load_pretrained_embed = config.load_pretrained_embed
+        self.num_classes = 2
+        
+        self.pad_idx = vocab.stoi['<pad>']
+        self.style_embed = Embedding(num_styles, self.d_model)
+        self.embed = EmbeddingLayer(
+            vocab, self.d_model, self.max_length,
+            self.pad_idx,
+            learned_pos_embed,
+            load_pretrained_embed
+        )
+        self.cls_token = nn.Parameter(torch.randn(self.d_model))
+        self.encoder = Encoder(num_layers, self.d_model, len(vocab), h, dropout)
+        self.device=config.device
+    
+    def forward(self, inp_tokens, inp_lengths, style=None):
+        batch_size = inp_tokens.size(0)
+        num_extra_token = 1 if style is None else 2
+        max_seq_len = inp_tokens.size(1)
+
+        pos_idx = torch.arange(max_seq_len).unsqueeze(0).expand((batch_size, -1)).to(inp_lengths.device)
+        mask = pos_idx >= inp_lengths.unsqueeze(-1)
+        for _ in range(num_extra_token):
+            mask = torch.cat((torch.zeros_like(mask[:, :1]), mask), 1)
+        mask = mask.view(batch_size, 1, 1, max_seq_len + num_extra_token)
+
+        cls_token = self.cls_token.view(1, 1, -1).expand(batch_size, -1, -1)
+
+        enc_input = cls_token
+        if style is not None:
+            style_emb = self.style_embed(style).unsqueeze(1)
+            enc_input = torch.cat((enc_input, style_emb), 1)
+            
+        enc_input = torch.cat((enc_input, self.embed(inp_tokens, pos_idx)), 1)#embed(inp_tokens,pos_idx)=[128.16.256].enc_input=[128,17,256]
+        
+        encoded_features = self.encoder(enc_input, mask)#直接拿encoder的输出作为classifer输入[128,17,256]
+        encoded_features_con = encoded_features.view(batch_size,-1)
+        classifier = Linear(self.d_model*(max_seq_len+num_extra_token), self.num_classes)
+        classifier.to(self.device)
+        
+        assert encoded_features_con.size(-1)== self.d_model*(max_seq_len+num_extra_token)    
+        logits = classifier(encoded_features_con) #17*256to2
+
+        return F.log_softmax(logits, -1)
         
     
 class Encoder(nn.Module):
@@ -172,6 +234,7 @@ class Decoder(nn.Module):
 
         return self.generator(self.norm(y), temperature)
     def incremental_forward(self, x, memory, src_mask, tgt_mask, temperature, prev_states=None):
+        #x为next token
         y = x
 
         new_states = []
@@ -182,11 +245,12 @@ class Decoder(nn.Module):
                 y, memory, src_mask, tgt_mask,
                 prev_states[i] if prev_states else None
             )
-
+        #每一层只取对应层的prev_states,prev_states实际上记录了每层中的变量状态
             new_states.append(new_sub_states)
         
         new_states.append(torch.cat((prev_states[-1], y), 1) if prev_states else y)
-        y = self.norm(new_states[-1])[:, -1:]
+        #前一个时刻的最后一层prev_state（列表最后一个元素)与y连接作为新元素
+        y = self.norm(new_states[-1])[:, -1:] #只取末位位置的状态，用于预测当前末位的输出
         
         return self.generator(y, temperature), new_states
     
@@ -244,17 +308,17 @@ class DecoderLayer(nn.Module):
     def incremental_forward(self, x, memory, src_mask, tgt_mask, prev_states=None):
         new_states = []
         m = memory
-
-        x = torch.cat((prev_states[0], x), 1) if prev_states else x
+        #3个子层，x为输入的next token
+        x = torch.cat((prev_states[0], x), 1) if prev_states else x #长度后+1
         new_states.append(x)
-        x = self.sublayer[0].incremental_forward(x, lambda x: self.self_attn(x[:, -1:], x, x, tgt_mask))
+        x = self.sublayer[0].incremental_forward(x, lambda x: self.self_attn(x[:, -1:], x, x, tgt_mask))#decoder端self_attention
         x = torch.cat((prev_states[1], x), 1) if prev_states else x
         new_states.append(x)
-        x = self.sublayer[1].incremental_forward(x, lambda x: self.src_attn(x[:, -1:], m, m, src_mask))
+        x = self.sublayer[1].incremental_forward(x, lambda x: self.src_attn(x[:, -1:], m, m, src_mask))#encoder端self_attention
         x = torch.cat((prev_states[2], x), 1) if prev_states else x
         new_states.append(x)
-        x = self.sublayer[2].incremental_forward(x, lambda x: self.pw_ffn(x[:, -1:]))
-        return x, new_states  
+        x = self.sublayer[2].incremental_forward(x, lambda x: self.pw_ffn(x[:, -1:]))#pwffn
+        return x, new_states  #记录通过3个子层时的输出new_states
    
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, h, dropout):
@@ -306,7 +370,7 @@ class SublayerConnection(nn.Module):
         self.layer_norm = LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x, sublayer):
+    def forward(self, x, sublayer):#sublayer=lambda x: self.self_attn(x[:, -1:], x, x, tgt_mask)直接给function即可
         y = sublayer(self.layer_norm(x))
         return x + self.dropout(y)
 
